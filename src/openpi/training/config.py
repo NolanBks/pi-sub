@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.robocasa_policy as robocasa_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -131,6 +132,8 @@ class ModelTransformFactory(GroupFactory):
                         inputs=[
                             _transforms.InjectDefaultPrompt(self.default_prompt),
                             _transforms.ResizeImages(224, 224),
+                            # Identity subtask fallback for datasets without hierarchical subtask labels.
+                            *([_transforms.InjectIdentitySubtask()] if model_config.train_subtask_prediction else []),
                             _transforms.TokenizePi05SubtaskInputs(
                                 tokenizer,
                                 discrete_state_input=model_config.discrete_state_input,
@@ -370,6 +373,55 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRoboCasa365DataConfig(DataConfigFactory):
+    """RoboCasa365 data with LeRobot ``language_persistent`` subtask labels."""
+
+    fps: float = 20.0
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if not isinstance(model_config, pi0_config.Pi0Config) or not model_config.pi05:
+            raise ValueError("RoboCasa365 subtask training requires a pi0.5 model config.")
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.ExtractActiveSubtask(
+                    language_key="language_persistent",
+                    timestamp_key="timestamp",
+                    action_key="action",
+                    style="subtask",
+                    fps=self.fps,
+                ),
+                _transforms.RepackTransform(
+                    {
+                        "observation/agentview_left": "observation.images.robot0_agentview_left",
+                        "observation/eye_in_hand": "observation.images.robot0_eye_in_hand",
+                        "observation/agentview_right": "observation.images.robot0_agentview_right",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                        "subtask": "subtask",
+                        "action_loss_mask": "action_loss_mask",
+                    }
+                ),
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[robocasa_policy.RoboCasaInputs(model_type=model_config.model_type)],
+            outputs=[robocasa_policy.RoboCasaOutputs(action_dim=12)],
+        )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+            action_sequence_keys=("action",),
+            prompt_from_task=True,
         )
 
 
@@ -777,6 +829,70 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    # pi0.5 LIBERO fine-tuning with two-stage (subtask) prediction enabled.
+    # Trains the joint flow-matching + subtask cross-entropy loss and enables staged inference
+    # (first decode a subtask, then flow-match actions conditioned on it). Works for both JAX and
+    # PyTorch. NOTE: LIBERO has no real hierarchical subtask labels, so an identity placeholder
+    # (subtask = task prompt) is injected automatically; swap in real ``subtask`` annotations in your
+    # dataset to get the full benefit of hierarchical inference.
+    TrainConfig(
+        name="pi05_libero_subtask",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            train_subtask_prediction=True,
+            sample_subtask_prediction=True,
+            flow_loss_weight=10.0,
+            subtask_loss_weight=1.0,
+            max_subtask_len=48,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    # Fine-tune pi0.5-base on a RoboCasa365 LeRobot dataset annotated with
+    # language_persistent rows whose style is "subtask". Pass the annotated
+    # Hugging Face repo at the CLI with --data.repo-id.
+    TrainConfig(
+        name="pi05_robocasa365_subtask",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            train_subtask_prediction=True,
+            sample_subtask_prediction=True,
+            flow_loss_weight=10.0,
+            subtask_loss_weight=1.0,
+            max_subtask_len=48,
+        ),
+        data=LeRobotRoboCasa365DataConfig(),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=100_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
     ),
     #

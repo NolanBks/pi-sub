@@ -92,6 +92,7 @@ class Pi0(_model.BaseModel):
         self.pi05 = config.pi05
         self.train_subtask_prediction = config.train_subtask_prediction
         self.sample_subtask_prediction = config.sample_subtask_prediction
+        self.flow_loss_weight = config.flow_loss_weight
         self.subtask_loss_weight = config.subtask_loss_weight
         self.max_subtask_len = config.max_subtask_len
         self.subtask_temperature = config.subtask_temperature
@@ -250,10 +251,26 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         action_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        action_loss = self.flow_loss_weight * self._mask_action_loss(action_loss, observation.action_loss_mask)
         if not self.train_subtask_prediction:
             return action_loss
         subtask_loss = self._compute_subtask_loss(prefix_out, observation)
         return action_loss + self.subtask_loss_weight * subtask_loss[:, None]
+
+    def _mask_action_loss(
+        self,
+        action_loss: at.Float[at.Array, "b ah"],
+        action_loss_mask: at.Bool[at.Array, "b ah"] | None,
+    ) -> at.Float[at.Array, "b ah"]:
+        if action_loss_mask is None:
+            return action_loss
+        mask = action_loss_mask.astype(action_loss.dtype)
+        valid_count = jnp.sum(mask, axis=-1, keepdims=True)
+        # An all-false mask can occur in shape-only fake inputs. Treat it as
+        # unmasked rather than silently removing the flow objective.
+        mask = jnp.where(valid_count > 0, mask, jnp.ones_like(mask))
+        valid_count = jnp.sum(mask, axis=-1, keepdims=True)
+        return action_loss * mask * (action_loss.shape[-1] / valid_count)
 
     def _compute_subtask_loss(
         self, prefix_out: at.Float[at.Array, "b s emb"], observation: _model.Observation
@@ -459,12 +476,12 @@ class Pi0(_model.BaseModel):
         )
 
         if include_action_suffix:
-            assert observation.tokenized_action_suffix is not None, (
-                "Tokenized action suffix is required for subtask prediction"
-            )
-            assert observation.tokenized_action_suffix_mask is not None, (
-                "Tokenized action suffix mask is required for subtask prediction"
-            )
+            assert (
+                observation.tokenized_action_suffix is not None
+            ), "Tokenized action suffix is required for subtask prediction"
+            assert (
+                observation.tokenized_action_suffix_mask is not None
+            ), "Tokenized action suffix mask is required for subtask prediction"
             subtask_len = jnp.sum(subtask_token_mask, axis=-1)
             suffix_positions = (
                 prompt_len[:, None]

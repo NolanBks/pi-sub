@@ -56,12 +56,14 @@ class Policy(BasePolicy):
         self._pytorch_device = pytorch_device
 
         if self._is_pytorch_model:
-            if getattr(model, "sample_subtask_prediction", False):
-                raise NotImplementedError("pi0.5 subtask prediction is currently implemented for JAX policies only.")
             self._model = self._model.to(pytorch_device)
             self._model.eval()
-            self._sample_actions = model.sample_actions
-            self._sample_actions_returns_dict = False
+            if getattr(model, "sample_subtask_prediction", False):
+                self._sample_actions = model.sample_actions_with_subtask
+                self._sample_actions_returns_dict = True
+            else:
+                self._sample_actions = model.sample_actions
+                self._sample_actions_returns_dict = False
         else:
             # JAX model setup
             if getattr(model, "sample_subtask_prediction", False):

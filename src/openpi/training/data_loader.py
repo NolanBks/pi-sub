@@ -7,9 +7,17 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
+
+try:
+    # LeRobot >= 0.4 (including datasets with language_persistent/language_events).
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+except ImportError:
+    # Backward compatibility with the LeRobot revision originally pinned by openpi.
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
 import openpi.models.model as _model
 import openpi.training.config as _config
@@ -137,8 +145,8 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
+    dataset_meta = LeRobotDatasetMetadata(repo_id)
+    dataset = LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys

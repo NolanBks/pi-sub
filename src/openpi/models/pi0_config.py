@@ -35,6 +35,7 @@ class Pi0Config(_model.BaseModelConfig):
     # Optional pi0.5 two-stage inference support. Disabled by default to preserve released checkpoint behavior.
     train_subtask_prediction: bool = False
     sample_subtask_prediction: bool = False
+    flow_loss_weight: float = 1.0
     subtask_loss_weight: float = 1.0
     max_subtask_len: int = 64
     subtask_temperature: float = 0.0
@@ -56,6 +57,8 @@ class Pi0Config(_model.BaseModelConfig):
             ]
         if (self.train_subtask_prediction or self.sample_subtask_prediction) and not self.pi05:
             raise ValueError("Subtask prediction is only supported for pi0.5 models.")
+        if self.flow_loss_weight <= 0:
+            raise ValueError("flow_loss_weight must be positive.")
         if self.train_subtask_prediction and self.subtask_loss_weight <= 0:
             raise ValueError("subtask_loss_weight must be positive when train_subtask_prediction is enabled.")
         if self.max_subtask_len <= 0:
@@ -76,7 +79,7 @@ class Pi0Config(_model.BaseModelConfig):
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0":
-        from openpi.models.pi0 import Pi0  # noqa: PLC0415
+        from openpi.models.pi0 import Pi0
 
         return Pi0(self, rngs=nnx.Rngs(rng))
 
@@ -105,6 +108,8 @@ class Pi0Config(_model.BaseModelConfig):
                 "token_ar_mask": jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 "token_loss_mask": jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.bool_),
             }
+        if self.train_subtask_prediction:
+            observation_kwargs["action_loss_mask"] = jax.ShapeDtypeStruct([batch_size, self.action_horizon], jnp.bool_)
         if self.sample_subtask_prediction:
             observation_kwargs |= {
                 "tokenized_action_suffix": jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),

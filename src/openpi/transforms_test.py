@@ -163,6 +163,66 @@ def test_tokenize_pi05_subtask_training_requires_subtask():
         )
 
 
+def test_extract_active_persistent_subtask_and_mask_boundary():
+    transform = _transforms.ExtractActiveSubtask(fps=10.0)
+    data = transform(
+        {
+            "timestamp": np.float32(0.1),
+            "action": np.zeros((5, 12), dtype=np.float32),
+            "language_persistent": [
+                {"role": "assistant", "content": "reach for the handle", "style": "subtask", "timestamp": 0.0},
+                {
+                    "role": "assistant",
+                    "content": "pull the door",
+                    "style": "subtask",
+                    "timestamp": np.float32(0.3),
+                },
+                {"role": "assistant", "content": "remember the goal", "style": "memory", "timestamp": 0.2},
+            ],
+        }
+    )
+
+    assert data["subtask"] == "reach for the handle"
+    assert np.array_equal(data["action_loss_mask"], np.array([True, True, False, False, False]))
+
+
+def test_extract_active_persistent_subtask_from_column_mapping():
+    transform = _transforms.ExtractActiveSubtask(fps=20.0)
+    data = transform(
+        {
+            "timestamp": 0.25,
+            "action": np.zeros((3, 12), dtype=np.float32),
+            "language_persistent": {
+                "role": ["assistant", "assistant"],
+                "content": ["open the door", "move away"],
+                "style": ["subtask", "subtask"],
+                "timestamp": np.array([0.0, 0.2], dtype=np.float32),
+            },
+        }
+    )
+
+    assert data["subtask"] == "move away"
+    assert np.all(data["action_loss_mask"])
+
+
+def test_extract_active_persistent_subtask_requires_frame_zero_coverage():
+    transform = _transforms.ExtractActiveSubtask()
+    with pytest.raises(ValueError, match="must cover frame 0"):
+        transform(
+            {
+                "timestamp": 0.0,
+                "language_persistent": [
+                    {"role": "assistant", "content": "open the door", "style": "subtask", "timestamp": 0.5}
+                ],
+            }
+        )
+
+
+def test_identity_subtask_is_not_injected_for_inference():
+    data = _transforms.InjectIdentitySubtask()({"prompt": "put the cup away"})
+    assert "subtask" not in data
+
+
 def test_tokenize_no_prompt():
     transform = _transforms.TokenizePrompt(_tokenizer.PaligemmaTokenizer())
 

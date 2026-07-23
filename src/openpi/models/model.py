@@ -70,6 +70,7 @@ IMAGE_RESOLUTION = (224, 224)
 #     "token_loss_mask": bool[*b, l],  # Optional, token loss mask
 #     "tokenized_action_suffix": int32[*b, l],  # Optional, tokenized action cue for staged pi0.5 inference
 #     "tokenized_action_suffix_mask": bool[*b, l],  # Optional, mask for tokenized action cue
+#     "action_loss_mask": bool[*b, ah],  # Optional, valid action targets for boundary-aware training
 #
 #      # Actions data.
 #      "actions": float32[*b ah ad]
@@ -112,6 +113,9 @@ class Observation(Generic[ArrayT]):
     tokenized_action_suffix: at.Int[ArrayT, "*b l"] | None = None
     tokenized_action_suffix_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Optional per-timestep mask for action chunks that cross a language/subtask boundary.
+    action_loss_mask: at.Bool[ArrayT, "*b ah"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -136,6 +140,7 @@ class Observation(Generic[ArrayT]):
             token_loss_mask=data.get("token_loss_mask"),
             tokenized_action_suffix=data.get("tokenized_action_suffix"),
             tokenized_action_suffix_mask=data.get("tokenized_action_suffix_mask"),
+            action_loss_mask=data.get("action_loss_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -217,6 +222,7 @@ def preprocess_observation(
         token_loss_mask=observation.token_loss_mask,
         tokenized_action_suffix=observation.tokenized_action_suffix,
         tokenized_action_suffix_mask=observation.tokenized_action_suffix_mask,
+        action_loss_mask=observation.action_loss_mask,
     )
 
 

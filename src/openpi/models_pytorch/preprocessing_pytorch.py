@@ -170,4 +170,7 @@ def preprocess_observation_pytorch(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        tokenized_action_suffix=observation.tokenized_action_suffix,
+        tokenized_action_suffix_mask=observation.tokenized_action_suffix_mask,
+        action_loss_mask=observation.action_loss_mask,
     )

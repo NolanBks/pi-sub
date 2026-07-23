@@ -267,6 +267,175 @@ class TokenizePrompt(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class InjectIdentitySubtask(DataTransformFn):
+    """Fallback that uses the task prompt as the subtask when no subtask annotation is present.
+
+    Datasets with real hierarchical subtask labels (e.g. "pick up the plate") should provide a ``subtask``
+    field; this identity placeholder only exists so subtask prediction can train on datasets (like LIBERO)
+    that lack such annotations. Must run after the prompt is available and before ``TokenizePi05SubtaskInputs``.
+    """
+
+    def __call__(self, data: DataDict) -> DataDict:
+        # This fallback is a training-only compatibility path. In particular, do not
+        # inject it during staged inference: the absence of ``subtask`` is what makes
+        # TokenizePi05SubtaskInputs prepare the autoregressive decoding inputs.
+        if "actions" not in data or data.get("subtask") is not None:
+            return data
+        prompt = data.get("prompt")
+        if prompt is None:
+            return data
+        return {**data, "subtask": prompt}
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractActiveSubtask(DataTransformFn):
+    """Extract the active LeRobot persistent subtask at the current frame.
+
+    ``language_persistent`` contains timestamped rows that are broadcast to every
+    frame in an episode. A persistent row becomes active at its timestamp and stays
+    active until the next row of the same style. This transform converts that
+    episode-level representation into the scalar ``subtask`` target expected by the
+    pi0.5 tokenizer.
+
+    When an action chunk crosses a subtask boundary, ``action_loss_mask`` excludes
+    action targets at and after the boundary. This keeps a training sample
+    conditioned on exactly one active subtask.
+    """
+
+    language_key: str = "language_persistent"
+    timestamp_key: str = "timestamp"
+    action_key: str = "action"
+    style: str = "subtask"
+    fps: float = 20.0
+
+    def __post_init__(self):
+        if self.fps <= 0:
+            raise ValueError("fps must be positive.")
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.language_key not in data:
+            raise ValueError(
+                f'Missing "{self.language_key}". Use a LeRobot dataset/read path that exposes '
+                "language_persistent annotations."
+            )
+        if self.timestamp_key not in data:
+            raise ValueError(f'Missing "{self.timestamp_key}", which is required to activate persistent language.')
+
+        current_timestamp = _to_scalar_float(data[self.timestamp_key], name=self.timestamp_key)
+        rows = [
+            row
+            for row in _language_rows(data[self.language_key])
+            if _to_optional_string(row.get("style")) == self.style
+        ]
+        if not rows:
+            raise ValueError(f'No language_persistent rows with style="{self.style}" were found.')
+
+        timestamped_rows = []
+        for row in rows:
+            timestamp = row.get("timestamp")
+            content = _to_optional_string(row.get("content"))
+            if timestamp is None or content is None or not content.strip():
+                continue
+            timestamped_rows.append((_to_scalar_float(timestamp, name="language timestamp"), content.strip()))
+
+        active_rows = [row for row in timestamped_rows if row[0] <= current_timestamp + 1e-6]
+        if not active_rows:
+            first_timestamp = min((timestamp for timestamp, _ in timestamped_rows), default=None)
+            raise ValueError(
+                f"No active subtask at timestamp {current_timestamp:.6f}. "
+                f"The first valid subtask starts at {first_timestamp!r}; persistent annotations must cover frame 0."
+            )
+
+        active_timestamp, active_subtask = max(active_rows, key=lambda row: row[0])
+        result = {**data, "subtask": active_subtask}
+
+        if self.action_key in data:
+            actions = np.asarray(data[self.action_key])
+            if actions.ndim < 2:
+                raise ValueError(
+                    f'Expected action chunk "{self.action_key}" to have at least 2 dimensions, got {actions.shape}.'
+                )
+            next_timestamps = [
+                timestamp
+                for timestamp, _ in timestamped_rows
+                if timestamp > max(current_timestamp, active_timestamp) + 1e-6
+            ]
+            if next_timestamps:
+                next_timestamp = min(next_timestamps)
+                action_timestamps = current_timestamp + np.arange(actions.shape[-2], dtype=np.float64) / self.fps
+                # LeRobot timestamps are float32, so use a small tolerance to
+                # classify an action exactly on the boundary as the next subtask.
+                result["action_loss_mask"] = action_timestamps < next_timestamp - 1e-6
+            else:
+                result["action_loss_mask"] = np.ones(actions.shape[-2], dtype=np.bool_)
+
+        return result
+
+
+def _language_rows(value) -> list[dict]:
+    """Normalize Arrow/NumPy/list representations of a LeRobot language column."""
+    if hasattr(value, "as_py"):
+        value = value.as_py()
+    if isinstance(value, np.ndarray):
+        value = value.item() if value.ndim == 0 else value.tolist()
+
+    if isinstance(value, Mapping):
+        # Hugging Face/Arrow can expose list(struct(...)) as a dict of columns.
+        columns = {}
+        for key, raw_column in value.items():
+            parsed_column = raw_column.as_py() if hasattr(raw_column, "as_py") else raw_column
+            if hasattr(parsed_column, "tolist") and not isinstance(parsed_column, str | bytes):
+                parsed_column = parsed_column.tolist()
+            columns[key] = parsed_column
+        sequence_lengths = [
+            len(column)
+            for column in columns.values()
+            if isinstance(column, Sequence) and not isinstance(column, str | bytes)
+        ]
+        if not sequence_lengths:
+            return [dict(columns)]
+        if len(set(sequence_lengths)) != 1:
+            raise ValueError("language_persistent columns have inconsistent lengths.")
+        return [
+            {
+                key: (column[index] if isinstance(column, Sequence) and not isinstance(column, str | bytes) else column)
+                for key, column in columns.items()
+            }
+            for index in range(sequence_lengths[0])
+        ]
+
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        raise ValueError(f"Unsupported language_persistent value of type {type(value).__name__}.")
+
+    rows = []
+    for raw_row in value:
+        parsed_row = raw_row.as_py() if hasattr(raw_row, "as_py") else raw_row
+        if isinstance(parsed_row, np.ndarray) and parsed_row.ndim == 0:
+            parsed_row = parsed_row.item()
+        if not isinstance(parsed_row, Mapping):
+            raise ValueError(f"Expected each language_persistent row to be a mapping, got {type(parsed_row).__name__}.")
+        rows.append(dict(parsed_row))
+    return rows
+
+
+def _to_scalar_float(value, *, name: str) -> float:
+    if hasattr(value, "item"):
+        value = value.item()
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a scalar number, got {value!r}.") from exc
+
+
+def _to_optional_string(value) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "item"):
+        value = value.item()
+    return str(value)
+
+
+@dataclasses.dataclass(frozen=True)
 class TokenizePi05SubtaskInputs(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
