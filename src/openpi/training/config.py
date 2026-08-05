@@ -426,6 +426,52 @@ class LeRobotRoboCasa365DataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotRoboCasa365ActionOnlyDataConfig(DataConfigFactory):
+    """RoboCasa365 v2.1 data without hierarchical subtask annotations."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if not isinstance(model_config, pi0_config.Pi0Config) or not model_config.pi05:
+            raise ValueError("RoboCasa365 action-only training requires a pi0.5 model config.")
+        if model_config.train_subtask_prediction or model_config.sample_subtask_prediction:
+            raise ValueError(
+                "RoboCasa365 action-only data must use a model with subtask prediction disabled. "
+                "Use LeRobotRoboCasa365DataConfig for annotated data."
+            )
+
+        # LeRobot v2.1 RoboCasa365 has no language_persistent column. Keep this
+        # repack path deliberately separate from the annotated-data factory above
+        # so action-only training never attempts to read a subtask annotation.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/agentview_left": "observation.images.robot0_agentview_left",
+                        "observation/eye_in_hand": "observation.images.robot0_eye_in_hand",
+                        "observation/agentview_right": "observation.images.robot0_agentview_right",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[robocasa_policy.RoboCasaInputs(model_type=model_config.model_type)],
+            outputs=[robocasa_policy.RoboCasaOutputs(action_dim=12)],
+        )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+            action_sequence_keys=("action",),
+            prompt_from_task=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -883,6 +929,31 @@ _CONFIGS = [
             max_subtask_len=48,
         ),
         data=LeRobotRoboCasa365DataConfig(),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=100_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # First-stage RoboCasa365 v2.1 fine-tuning without subtask annotations.
+    # This trains only the pi0.5 flow-matching action objective and can be
+    # followed by pi05_robocasa365_subtask when annotated data is available.
+    TrainConfig(
+        name="pi05_robocasa365_v21_action_only",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            train_subtask_prediction=False,
+            sample_subtask_prediction=False,
+        ),
+        data=LeRobotRoboCasa365ActionOnlyDataConfig(),
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
